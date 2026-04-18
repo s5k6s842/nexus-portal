@@ -1,0 +1,265 @@
+version: '3.8'
+
+networks:
+  portal-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  nocodb_data:
+  qdrant_data:
+  ollama_data:
+  redis_data:
+  n8n_data:
+  dify_storage:
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: portal-postgres
+    environment:
+      POSTGRES_USER: portal_user
+      POSTGRES_PASSWORD: portal_pass
+      POSTGRES_DB: portal_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - portal-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal_user -d portal_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── NocoDB (PostgreSQL をメタストアに使用) ──────────────────────────────────
+  nocodb:
+    image: nocodb/nocodb:latest
+    container_name: portal-nocodb
+    environment:
+      NC_DB: "pg://postgres:5432?u=portal_user&p=portal_pass&d=portal_db"
+      NC_AUTH_JWT_SECRET: "change-me-in-production"
+    volumes:
+      - nocodb_data:/usr/app/data
+    ports:
+      - "8080:8080"
+    networks:
+      - portal-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Qdrant (ベクトルDB) ─────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: portal-qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"   # HTTP / REST API
+      - "6334:6334"   # gRPC
+    networks:
+      - portal-net
+    restart: unless-stopped
+
+  # ── Ollama (LLM エンジン / CPU モード) ─────────────────────────────────────
+  # GPU を使う場合は下の deploy セクションのコメントを外してください。
+  ollama:
+    image: ollama/ollama:latest
+    container_name: portal-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - portal-net
+    environment:
+      OLLAMA_NUM_GPU: "0"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        ollama serve &
+        SERVER_PID=$$!
+        echo "[ollama-init] Waiting for server to be ready..."
+        until curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; do
+          sleep 2
+        done
+        echo "[ollama-init] Pulling qwen2:1.5b ..."
+        ollama pull qwen2:1.5b
+        echo "[ollama-init] Model ready."
+        wait $$SERVER_PID
+    # ── GPU 使用時はここのコメントを外す ──────────────────────────────────────
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+  # ── Redis (Dify のキュー・キャッシュ用) ────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: portal-redis
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - portal-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Dify API ────────────────────────────────────────────────────────────────
+  dify-api:
+    image: langgenius/dify-api:latest
+    container_name: portal-dify-api
+    environment:
+      MODE: api
+      SECRET_KEY: "change-me-dify-secret-32chars-xxx"
+      LOG_LEVEL: INFO
+      # PostgreSQL (dify 専用 DB)
+      DB_USERNAME: portal_user
+      DB_PASSWORD: portal_pass
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: dify_db
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: 0
+      CELERY_BROKER_URL: "redis://redis:6379/1"
+      # ストレージ (ローカル)
+      STORAGE_TYPE: local
+      LOCAL_STORAGE_PATH: /app/api/storage
+      # ベクトルDB (既存 Qdrant を共用)
+      VECTOR_STORE: qdrant
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_API_KEY: ""
+      # 公開 URL (ローカル PoC 用)
+      CONSOLE_WEB_URL: "http://localhost:3000"
+      CONSOLE_API_URL: "http://localhost:5001"
+      SERVICE_API_URL: "http://localhost:5001"
+      APP_WEB_URL: "http://localhost:3000"
+      # コード実行サンドボックス
+      CODE_EXECUTION_ENDPOINT: "http://dify-sandbox:8194"
+      CODE_EXECUTION_API_KEY: "dify-sandbox-secret"
+    volumes:
+      - dify_storage:/app/api/storage
+    ports:
+      - "5001:5001"
+    networks:
+      - portal-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Dify Worker (Celery 非同期タスク) ──────────────────────────────────────
+  dify-worker:
+    image: langgenius/dify-api:latest
+    container_name: portal-dify-worker
+    environment:
+      MODE: worker
+      SECRET_KEY: "change-me-dify-secret-32chars-xxx"
+      DB_USERNAME: portal_user
+      DB_PASSWORD: portal_pass
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: dify_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: 0
+      CELERY_BROKER_URL: "redis://redis:6379/1"
+      STORAGE_TYPE: local
+      LOCAL_STORAGE_PATH: /app/api/storage
+      VECTOR_STORE: qdrant
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_API_KEY: ""
+      CODE_EXECUTION_ENDPOINT: "http://dify-sandbox:8194"
+      CODE_EXECUTION_API_KEY: "dify-sandbox-secret"
+    volumes:
+      - dify_storage:/app/api/storage
+    networks:
+      - portal-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Dify Sandbox (コード実行環境) ──────────────────────────────────────────
+  dify-sandbox:
+    image: langgenius/dify-sandbox:latest
+    container_name: portal-dify-sandbox
+    environment:
+      API_KEY: "dify-sandbox-secret"
+      GIN_MODE: release
+    networks:
+      - portal-net
+    restart: unless-stopped
+
+  # ── Dify Web (フロントエンド) ───────────────────────────────────────────────
+  dify-web:
+    image: langgenius/dify-web:latest
+    container_name: portal-dify-web
+    environment:
+      CONSOLE_API_URL: "http://localhost:5001"
+      APP_API_URL: "http://localhost:5001"
+    ports:
+      - "3000:3000"
+    networks:
+      - portal-net
+    depends_on:
+      - dify-api
+    restart: unless-stopped
+
+  # ── n8n (ワークフロー自動化) ────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: portal-n8n
+    environment:
+      # PostgreSQL (n8n 専用 DB)
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n_db
+      DB_POSTGRESDB_USER: portal_user
+      DB_POSTGRESDB_PASSWORD: portal_pass
+      # 基本認証
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: admin
+      N8N_BASIC_AUTH_PASSWORD: "n8n_admin_pass"
+      # ホスト設定
+      N8N_HOST: "localhost"
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: "http://localhost:5678"
+      GENERIC_TIMEZONE: "Asia/Tokyo"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    ports:
+      - "5678:5678"
+    networks:
+      - portal-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
